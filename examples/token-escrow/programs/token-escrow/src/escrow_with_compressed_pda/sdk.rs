@@ -105,9 +105,15 @@ pub fn create_escrow_instruction(
         compressed_token_cpi_authority_pda,
         account_compression_authority,
         self_program: crate::ID,
-        token_owner_pda: token_owner_pda.0,
+        token_owner_pda: solana_sdk::system_program::id(),
         system_program: solana_sdk::system_program::id(),
         cpi_context_account: *input_params.cpi_context_account,
+        associated_token_program: spl_token_2022::ID,
+        token_program: spl_token_2022::ID,
+        escrow: solana_sdk::system_program::id(),
+        unwrapped_mint: *input_params.mint,
+        unwrapped_token_account: solana_sdk::system_program::id(),
+        wrapped_mint_backpointer: solana_sdk::system_program::id(),
     };
     let remaining_accounts = to_account_metas(remaining_accounts);
 
@@ -230,6 +236,12 @@ pub fn create_withdrawal_instruction(
         token_owner_pda,
         system_program: solana_sdk::system_program::id(),
         cpi_context_account: *input_params.cpi_context_account,
+        associated_token_program: spl_token_2022::ID,
+        token_program: spl_token_2022::ID,
+        escrow: solana_sdk::system_program::id(),
+        unwrapped_mint: *input_params.mint,
+        unwrapped_token_account: solana_sdk::system_program::id(),
+        wrapped_mint_backpointer: solana_sdk::system_program::id(),
     };
     let remaining_accounts = to_account_metas(remaining_accounts);
 

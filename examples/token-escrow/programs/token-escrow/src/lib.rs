@@ -137,6 +137,7 @@ pub mod token_escrow {
             output_state_merkle_tree_account_indices,
             cpi_context,
             input_compressed_pda,
+            withdrawal_amount,
             bump,
         )
     }

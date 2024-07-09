@@ -1,13 +1,15 @@
 use crate::{create_change_output_compressed_token_account, program::TokenEscrow, EscrowTimeLock};
 use account_compression::{program::AccountCompression, RegisteredProgram};
 use anchor_lang::prelude::*;
+use anchor_spl::{token_2022::TransferChecked, token_interface::TokenInterface};
 use light_compressed_token::{
     process_transfer::{
         CompressedTokenInstructionDataTransfer, InputTokenDataWithContext,
         PackedTokenTransferOutputData,
-    },
+    },accounts::MintToInstruction,
     program::LightCompressedToken,
 };
+use anchor_lang::solana_program::program_pack::Pack;
 use light_hasher::{errors::HasherError, DataHasher, Hasher, Poseidon};
 use light_sdk::{
     light_accounts, utils::create_cpi_inputs_for_new_address, verify::verify, LightTraits,
@@ -44,8 +46,28 @@ pub struct EscrowCompressedTokensWithCompressedPda<'info> {
     #[cpi_context]
     #[account(mut)]
     pub cpi_context_account: Account<'info, CpiContextAccount>,
+
+    pub unwrapped_mint: Box<InterfaceAccount<'info, anchor_spl::token_interface::Mint>>,
+    #[account(mut)]
+    pub unwrapped_token_account: Box<InterfaceAccount<'info, anchor_spl::token_interface::TokenAccount>>,
+    /// CHECK: 
+    #[account(init_if_needed, payer = signer, space = 8 + 32,
+        seeds = [b"backpointa", unwrapped_mint.key().as_ref(), token_program.key().as_ref()],
+        bump
+    )]
+    pub wrapped_mint_backpointer: Account<'info, Backpointer>,
+    /// CHECK: 
+    pub token_program: Interface<'info, TokenInterface>,
+    #[account(init_if_needed, payer = signer, associated_token::authority = wrapped_mint_backpointer, associated_token::mint = unwrapped_mint)]
+    pub escrow: Box<InterfaceAccount<'info, anchor_spl::token_interface::TokenAccount>>,
+    /// CHECK:
+    pub associated_token_program: UncheckedAccount<'info>
 }
 
+#[account]
+pub struct Backpointer {
+    pub wrapped_mint: Pubkey,
+}
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
 pub struct PackedInputCompressedPda {
     pub old_lock_up_time: u64,
@@ -71,6 +93,7 @@ pub fn process_escrow_compressed_tokens_with_compressed_pda<'info>(
     cpi_context: CompressedCpiContext,
     bump: u8,
 ) -> Result<()> {
+    
     let compressed_pda = create_compressed_pda_data(lock_up_time, &ctx, &new_address_params)?;
     let escrow_token_data = PackedTokenTransferOutputData {
         amount: escrow_amount,
@@ -85,6 +108,31 @@ pub fn process_escrow_compressed_tokens_with_compressed_pda<'info>(
         output_state_merkle_tree_account_indices[1],
     );
     let output_compressed_accounts = vec![escrow_token_data, change_token_data];
+    let backpointer = &mut ctx.accounts.wrapped_mint_backpointer;
+    backpointer.wrapped_mint = mint;
+    let ai = ctx.accounts.unwrapped_mint.to_account_info();
+    let unwrapped_mint_data = &ai.try_borrow_data()?;
+    let unwrapped_mint = spl_token_2022::state::Mint::unpack(&unwrapped_mint_data)?;
+
+    // Now, you can access the `decimals` field of the mint
+    let decimals = unwrapped_mint.decimals;
+    let seeds = &[b"backpointa", ctx.accounts.unwrapped_mint.to_account_info().key.as_ref(), ctx.accounts.token_program.to_account_info().key.as_ref(), &[ctx.bumps.wrapped_mint_backpointer]];
+    let signer = &[&seeds[..]];
+
+    // Proceed with the wrapping logic, ensuring the amounts are scaled correctly according to the decimals
+    // Example: Transfer tokens from the user's account to the escrow
+    let transfer_to_escrow_cpi_accounts = TransferChecked {
+        from: ctx.accounts.unwrapped_token_account.to_account_info(),
+        to: ctx.accounts.escrow.to_account_info(),
+        authority: ctx.accounts.signer.to_account_info(),
+        mint: ctx.accounts.unwrapped_mint.to_account_info(),
+    };
+    let transfer_to_escrow_cpi_context = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        transfer_to_escrow_cpi_accounts,
+        signer,
+    );
+    anchor_spl::token_interface::transfer_checked(transfer_to_escrow_cpi_context, escrow_amount, decimals)?;
 
     cpi_compressed_token_transfer_pda(
         &ctx,
@@ -94,6 +142,7 @@ pub fn process_escrow_compressed_tokens_with_compressed_pda<'info>(
         output_compressed_accounts,
         proof.clone(),
         cpi_context,
+        escrow_amount
     )?;
     cpi_compressed_pda_transfer(
         ctx,
@@ -181,26 +230,49 @@ pub fn cpi_compressed_token_transfer_pda<'info>(
     output_compressed_accounts: Vec<PackedTokenTransferOutputData>,
     proof: CompressedProof,
     mut cpi_context: CompressedCpiContext,
+    escrow_amount: u64
 ) -> Result<()> {
     cpi_context.set_context = true;
-
-    let inputs_struct = CompressedTokenInstructionDataTransfer {
-        proof: Some(proof),
-        mint,
-        delegated_transfer: None,
-        input_token_data_with_context,
-        output_compressed_accounts,
-        is_compress: false,
-        compress_or_decompress_amount: None,
-        cpi_context: Some(cpi_context),
+ 
+    let inputs_struct = MintToInstruction {
+        fee_payer: *ctx.accounts.signer.to_account_info().key,
+        authority: *ctx.accounts.signer.to_account_info().key,
+        cpi_authority_pda: *ctx.accounts.compressed_token_cpi_authority_pda.to_account_info().key,
+        mint: *ctx.accounts.unwrapped_mint.to_account_info().key,
+        token_pool_pda: *ctx.accounts.token_owner_pda.to_account_info().key,
+        token_program: *ctx.accounts.token_program.to_account_info().key,
+        light_system_program: *ctx.accounts.light_system_program.to_account_info().key,
+        registered_program_pda: *ctx.accounts.registered_program_pda.to_account_info().key,
+        noop_program: *ctx.accounts.noop_program.to_account_info().key,
+        account_compression_authority: *ctx.accounts.account_compression_authority.to_account_info().key,
+        account_compression_program: *ctx.accounts.account_compression_program.to_account_info().key,
+        merkle_tree: *ctx.remaining_accounts[0].to_account_info().key,
+        self_program: *ctx.accounts.compressed_token_program.to_account_info().key,
+        system_program: *ctx.accounts.system_program.to_account_info().key,
     };
 
-    let mut inputs = Vec::new();
-    CompressedTokenInstructionDataTransfer::serialize(&inputs_struct, &mut inputs).unwrap();
+    let inputs = vec![
+        *ctx.accounts.signer.to_account_info().key,
+        *ctx.accounts.compressed_token_cpi_authority_pda.to_account_info().key,
+        *ctx.accounts.unwrapped_mint.to_account_info().key,
+        *ctx.accounts.token_owner_pda.to_account_info().key,
+        *ctx.accounts.token_program.to_account_info().key,
+        *ctx.accounts.light_system_program.to_account_info().key,
+        *ctx.accounts.registered_program_pda.to_account_info().key,
+        *ctx.accounts.noop_program.to_account_info().key,
+        *ctx.accounts.account_compression_authority.to_account_info().key,
+        *ctx.accounts.account_compression_program.to_account_info().key,
+        *ctx.remaining_accounts[0].to_account_info().key,
+        *ctx.accounts.compressed_token_program.to_account_info().key,
+        *ctx.accounts.system_program.to_account_info().key,
+    ];
 
-    let cpi_accounts = light_compressed_token::cpi::accounts::TransferInstruction {
+    let cpi_accounts = light_compressed_token::cpi::accounts::MintToInstruction {
         fee_payer: ctx.accounts.signer.to_account_info(),
         authority: ctx.accounts.signer.to_account_info(),
+        merkle_tree: ctx.remaining_accounts[0].to_account_info(),
+        mint: ctx.accounts.unwrapped_mint.to_account_info(),
+        token_program: ctx.accounts.token_program.to_account_info(),
         registered_program_pda: ctx.accounts.registered_program_pda.to_account_info(),
         noop_program: ctx.accounts.noop_program.to_account_info(),
         account_compression_authority: ctx.accounts.account_compression_authority.to_account_info(),
@@ -211,9 +283,7 @@ pub fn cpi_compressed_token_transfer_pda<'info>(
             .compressed_token_cpi_authority_pda
             .to_account_info(),
         light_system_program: ctx.accounts.light_system_program.to_account_info(),
-        token_pool_pda: None,
-        compress_or_decompress_token_account: None,
-        token_program: None,
+        token_pool_pda: ctx.accounts.token_owner_pda.to_account_info(),
         system_program: ctx.accounts.system_program.to_account_info(),
     };
 
@@ -224,6 +294,6 @@ pub fn cpi_compressed_token_transfer_pda<'info>(
 
     cpi_ctx.remaining_accounts = ctx.remaining_accounts.to_vec();
 
-    light_compressed_token::cpi::transfer(cpi_ctx, inputs)?;
+    light_compressed_token::cpi::mint_to(cpi_ctx, inputs, vec![escrow_amount])?;
     Ok(())
 }
